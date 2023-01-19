@@ -26,6 +26,7 @@ from sagemaker.processing import (
     ScriptProcessor,
 )
 from sagemaker.sklearn.processing import SKLearnProcessor
+from sagemaker.spark.processing import PySparkProcessor
 from sagemaker.workflow.conditions import ConditionLessThanOrEqualTo
 from sagemaker.workflow.condition_step import (
     ConditionStep,
@@ -143,8 +144,8 @@ def get_pipeline(
     """
     sagemaker_session = get_session(region, default_bucket)
     if role is None:
-        role = sagemaker.session.get_execution_role(sagemaker_session)
-
+        role = sagemaker.get_execution_role()#sagemaker.session.get_execution_role(sagemaker_session)
+    print("this is the :", role)
     pipeline_session = get_pipeline_session(region, default_bucket)
 
     # parameters for pipeline execution
@@ -158,27 +159,53 @@ def get_pipeline(
     )
 
     # processing step for feature engineering
-    sklearn_processor = SKLearnProcessor(
-        framework_version="0.23-1",
-        instance_type=processing_instance_type,
-        instance_count=processing_instance_count,
-        base_job_name=f"{base_job_prefix}/sklearn-abalone-preprocess",
+    bucket = 'sagemaker-py-spark-exp'
+    code_prefix = 'mlscripts'
+    logs_prefix = 'logs'
+    input_prefix = 'mldata'
+    output_prefix = 'processingPipelineOutput'
+    s3_output_train_data = 's3://{}/{}/train/train.parquet'.format(bucket, output_prefix)
+
+    # processing step for feature engineering
+    # sklearn_processor = SKLearnProcessor(
+    #     framework_version="0.23-1",
+    #     instance_type=processing_instance_type,
+    #     instance_count=processing_instance_count,
+    #     base_job_name=f"{base_job_prefix}/sklearn-abalone-preprocess",
+    #     sagemaker_session=pipeline_session,
+    #     role=role,
+    # )
+    spark_preprocess_job = PySparkProcessor(
+        framework_version='2.4',
         sagemaker_session=pipeline_session,
         role=role,
+        instance_type='ml.m5.xlarge',
+        instance_count=2, # multiple machine distributed computing
+        base_job_name='spark-ml-sagemaker-processing-'
     )
-    step_args = sklearn_processor.run(
+    step_args = spark_preprocess_job.run(
         outputs=[
-            ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
-            ProcessingOutput(output_name="validation", source="/opt/ml/processing/validation"),
-            ProcessingOutput(output_name="test", source="/opt/ml/processing/test"),
+            ProcessingOutput(output_name="train", source="/opt/ml/processing/train/train.parquet",destination =s3_output_train_data, s3_upload_mode='Continuous')
         ],
-        code=os.path.join(BASE_DIR, "preprocess.py"),
-        arguments=["--input-data", input_data],
+        submit_app=os.path.join(BASE_DIR, "preprocess.py"),
+        arguments=['--s3-input-bucket', bucket,
+               '--s3-input-prefix', input_prefix,
+               '--train-split-size', '0.70',
+               '--test-split-size', '0.30',
+               '--s3-output-bucket', bucket,
+               '--s3-output-prefix', output_prefix,
+               '--repartition-num', '1'],
     )
+    print(step_args)
+    
     step_process = ProcessingStep(
-        name="PreprocessAbaloneData",
+        name="SparkProcessData",
         step_args=step_args,
     )
+    
+    # print("----")
+    # print("s3://"+bucket+"/"+step_process.step_args['AppSpecification']['ContainerArguments'][11]+"/train/train.parquet")
+    # print("$$$$$$$$$")
 
     # training step for generating model artifacts
     model_path = f"s3://{sagemaker_session.default_bucket()}/{base_job_prefix}/AbaloneTrain"
