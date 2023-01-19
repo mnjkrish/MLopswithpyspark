@@ -1,121 +1,83 @@
-"""Feature engineers the abalone dataset."""
-import argparse
-import logging
+# mods
 import os
-import pathlib
-import requests
-import tempfile
+import argparse
+import pyspark
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.sql.types import DoubleType, StringType, StructField, StructType
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, StandardScaler, VectorAssembler
+from pyspark.ml.feature import HashingTF, IDF, Tokenizer
+import pyspark.sql.functions as f
+import sys
 
 import boto3
-import numpy as np
-import pandas as pd
 
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+# create app
+spark = SparkSession.builder.appName('spark-python-sagemaker-processing').getOrCreate()
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
+# schema
+schema = StructType([StructField('category', StringType(), True), 
+                     StructField('message', StringType(), True)])
 
-
-# Since we get a headerless CSV file we specify the column names here.
-feature_columns_names = [
-    "sex",
-    "length",
-    "diameter",
-    "height",
-    "whole_weight",
-    "shucked_weight",
-    "viscera_weight",
-    "shell_weight",
-]
-label_column = "rings"
-
-feature_columns_dtype = {
-    "sex": str,
-    "length": np.float64,
-    "diameter": np.float64,
-    "height": np.float64,
-    "whole_weight": np.float64,
-    "shucked_weight": np.float64,
-    "viscera_weight": np.float64,
-    "shell_weight": np.float64,
-}
-label_column_dtype = {"rings": np.float64}
-
-
-def merge_two_dicts(x, y):
-    """Merges two dicts, returning a new copy."""
-    z = x.copy()
-    z.update(y)
-    return z
-
-
-if __name__ == "__main__":
-    logger.debug("Starting preprocessing.")
+def main():
+    
+    #args
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-data", type=str, required=True)
+    parser.add_argument('--s3-input-bucket', type=str)
+    parser.add_argument('--s3-input-prefix', type=str)
+    parser.add_argument('--train-split-size', type=float)
+    parser.add_argument('--test-split-size', type=float)
+    parser.add_argument('--s3-output-bucket', type=str)
+    parser.add_argument('--s3-output-prefix', type=str)
+    parser.add_argument('--repartition-num', type=int)
     args = parser.parse_args()
+    
+    # read dataset
+    print('s3://' + os.path.join(args.s3_input_bucket, args.s3_input_prefix,'spamdataset.csv'))
+    print(os.getcwd())
 
-    base_dir = "/opt/ml/processing"
-    pathlib.Path(f"{base_dir}/data").mkdir(parents=True, exist_ok=True)
-    input_data = args.input_data
-    bucket = input_data.split("/")[2]
-    key = "/".join(input_data.split("/")[3:])
+    print("this is the dataset")
+    try:
+        df = spark.read.csv('s3://' + os.path.join(args.s3_input_bucket, args.s3_input_prefix, 'spamdataset.csv'),
+                        header=False,
+                           schema= schema)
+    except Exception as e:
+        print("problem : ",e)
+    print("after reading")
+    # drop nan
+    df = df.na.drop()
+    
+    df = df.select("*", f.lower(f.col("message")).alias("messages")).drop("message")
+    inx = StringIndexer(inputCol='category', outputCol='category_index')
+    encoded = inx.fit(df)
+    encoded_trans = encoded.transform(df)
+    
+    tokenizer = Tokenizer(inputCol="messages", outputCol="words")
+    wordsData = tokenizer.transform(encoded_trans).drop("messages","category")
+    
+    
+    
+    
+    
+    (train_df, test_df) = wordsData.randomSplit([args.train_split_size, args.test_split_size], seed=0)
+    
+    # write
+    (train_df
+    .repartition(args.repartition_num)
+    .write
+    .mode('overwrite')
+    .parquet(('s3://' + os.path.join(args.s3_output_bucket, args.s3_output_prefix, 'train', 'train.parquet'))))
+    print("---Writing to output")
+    
+   
+    (test_df
+    .repartition(args.repartition_num)
+    .write
+    .mode('overwrite')
+    .parquet(('s3://' + os.path.join(args.s3_output_bucket, args.s3_output_prefix, 'test', 'test.parquet'))))
+    print("---Wrote the output")
+    # kill app
+    spark.stop()
 
-    logger.info("Downloading data from bucket: %s, key: %s", bucket, key)
-    fn = f"{base_dir}/data/abalone-dataset.csv"
-    s3 = boto3.resource("s3")
-    s3.Bucket(bucket).download_file(key, fn)
-
-    logger.debug("Reading downloaded data.")
-    df = pd.read_csv(
-        fn,
-        header=None,
-        names=feature_columns_names + [label_column],
-        dtype=merge_two_dicts(feature_columns_dtype, label_column_dtype),
-    )
-    os.unlink(fn)
-
-    logger.debug("Defining transformers.")
-    numeric_features = list(feature_columns_names)
-    numeric_features.remove("sex")
-    numeric_transformer = Pipeline(
-        steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
-    )
-
-    categorical_features = ["sex"]
-    categorical_transformer = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
-
-    preprocess = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, numeric_features),
-            ("cat", categorical_transformer, categorical_features),
-        ]
-    )
-
-    logger.info("Applying transforms.")
-    y = df.pop("rings")
-    X_pre = preprocess.fit_transform(df)
-    y_pre = y.to_numpy().reshape(len(y), 1)
-
-    X = np.concatenate((y_pre, X_pre), axis=1)
-
-    logger.info("Splitting %d rows of data into train, validation, test datasets.", len(X))
-    logger.info(f"X Shape: {X.shape}")
-    np.random.shuffle(X)
-    train, validation, test = np.split(X, [int(0.7 * len(X)), int(0.85 * len(X))])
-
-    logger.info("Writing out datasets to %s.", base_dir)
-    pd.DataFrame(train).to_csv(f"{base_dir}/train/train.csv", header=False, index=False)
-    pd.DataFrame(validation).to_csv(
-        f"{base_dir}/validation/validation.csv", header=False, index=False
-    )
-    pd.DataFrame(test).to_csv(f"{base_dir}/test/test.csv", header=False, index=False)
+if __name__ == '__main__':
+    main()
