@@ -144,8 +144,8 @@ def get_pipeline(
     """
     sagemaker_session = get_session(region, default_bucket)
     if role is None:
-        role = sagemaker.get_execution_role()#sagemaker.session.get_execution_role(sagemaker_session)
-    print("this is the :", role)
+        role = sagemaker.session.get_execution_role(sagemaker_session)
+
     pipeline_session = get_pipeline_session(region, default_bucket)
 
     # parameters for pipeline execution
@@ -157,9 +157,8 @@ def get_pipeline(
         name="InputDataUrl",
         default_value=f"s3://sagemaker-servicecatalog-seedcode-{region}/dataset/abalone-dataset.csv",
     )
-
-    # processing step for feature engineering
-    bucket = 'sagemaker-py-spark-exp'
+    
+    bucket = 'transtest-poc'
     code_prefix = 'mlscripts'
     logs_prefix = 'logs'
     input_prefix = 'mldata'
@@ -203,9 +202,9 @@ def get_pipeline(
         step_args=step_args,
     )
     
-    # print("----")
-    # print("s3://"+bucket+"/"+step_process.step_args['AppSpecification']['ContainerArguments'][11]+"/train/train.parquet")
-    # print("$$$$$$$$$")
+    print("----")
+    print("s3://"+bucket+"/"+step_process.step_args['AppSpecification']['ContainerArguments'][11]+"/train/train.parquet")
+    print("$$$$$$$$$")
 
     # training step for generating model artifacts
     model_path = f"s3://{sagemaker_session.default_bucket()}/{base_job_prefix}/AbaloneTrain"
@@ -216,129 +215,135 @@ def get_pipeline(
         py_version="py3",
         instance_type=training_instance_type,
     )
-    xgb_train = Estimator(
-        image_uri=image_uri,
-        instance_type=training_instance_type,
-        instance_count=1,
-        output_path=model_path,
-        base_job_name=f"{base_job_prefix}/abalone-train",
+    # xgb_train = Estimator(
+    #     image_uri=image_uri,
+    #     instance_type=training_instance_type,
+    #     instance_count=1,
+    #     output_path=model_path,
+    #     base_job_name=f"{base_job_prefix}/abalone-train",
+    #     sagemaker_session=pipeline_session,
+    #     role=role,
+    # )
+    # xgb_train.set_hyperparameters(
+    #     objective="reg:linear",
+    #     num_round=50,
+    #     max_depth=5,
+    #     eta=0.2,
+    #     gamma=4,
+    #     min_child_weight=6,
+    #     subsample=0.7,
+    #     silent=0,
+    # )
+    spark_train_job = PySparkProcessor(
+        framework_version='2.4',
         sagemaker_session=pipeline_session,
         role=role,
+        instance_type='ml.m5.xlarge',
+        instance_count=2, # multiple machine distributed computing
+        base_job_name='spark-ml-sagemaker-training-'
     )
-    xgb_train.set_hyperparameters(
-        objective="reg:linear",
-        num_round=50,
-        max_depth=5,
-        eta=0.2,
-        gamma=4,
-        min_child_weight=6,
-        subsample=0.7,
-        silent=0,
-    )
-    step_args = xgb_train.fit(
-        inputs={
-            "train": TrainingInput(
-                s3_data=step_process.properties.ProcessingOutputConfig.Outputs[
+    step_args = spark_train_job.run(
+        inputs=[
+            ProcessingInput(
+                source=step_process.properties.ProcessingOutputConfig.Outputs[
                     "train"
                 ].S3Output.S3Uri,
-                content_type="text/csv",
+                destination="/opt/ml/processing/train",
             ),
-            "validation": TrainingInput(
-                s3_data=step_process.properties.ProcessingOutputConfig.Outputs[
-                    "validation"
-                ].S3Output.S3Uri,
-                content_type="text/csv",
-            ),
-        },
+        ],
+        submit_app=os.path.join(BASE_DIR, "train.py"),
+        arguments=['--s3-input-bucket', bucket,
+                   '--s3-input-prefix', 'processingPipelineOutput/train/train.parquet',
+                   '--repartition-num', '1']
     )
-    step_train = TrainingStep(
-        name="TrainAbaloneModel",
+    step_train = ProcessingStep(
+        name="TrainsparkModel",
         step_args=step_args,
     )
 
     # processing step for evaluation
-    script_eval = ScriptProcessor(
-        image_uri=image_uri,
-        command=["python3"],
-        instance_type=processing_instance_type,
-        instance_count=1,
-        base_job_name=f"{base_job_prefix}/script-abalone-eval",
-        sagemaker_session=pipeline_session,
-        role=role,
-    )
-    step_args = script_eval.run(
-        inputs=[
-            ProcessingInput(
-                source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-                destination="/opt/ml/processing/model",
-            ),
-            ProcessingInput(
-                source=step_process.properties.ProcessingOutputConfig.Outputs[
-                    "test"
-                ].S3Output.S3Uri,
-                destination="/opt/ml/processing/test",
-            ),
-        ],
-        outputs=[
-            ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation"),
-        ],
-        code=os.path.join(BASE_DIR, "evaluate.py"),
-    )
-    evaluation_report = PropertyFile(
-        name="AbaloneEvaluationReport",
-        output_name="evaluation",
-        path="evaluation.json",
-    )
-    step_eval = ProcessingStep(
-        name="EvaluateAbaloneModel",
-        step_args=step_args,
-        property_files=[evaluation_report],
-    )
+#     script_eval = ScriptProcessor(
+#         image_uri=image_uri,
+#         command=["python3"],
+#         instance_type=processing_instance_type,
+#         instance_count=1,
+#         base_job_name=f"{base_job_prefix}/script-abalone-eval",
+#         sagemaker_session=pipeline_session,
+#         role=role,
+#     )
+#     step_args = script_eval.run(
+#         inputs=[
+#             ProcessingInput(
+#                 source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+#                 destination="/opt/ml/processing/model",
+#             ),
+#             ProcessingInput(
+#                 source=step_process.properties.ProcessingOutputConfig.Outputs[
+#                     "test"
+#                 ].S3Output.S3Uri,
+#                 destination="/opt/ml/processing/test",
+#             ),
+#         ],
+#         outputs=[
+#             ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation"),
+#         ],
+#         code=os.path.join(BASE_DIR, "evaluate.py"),
+#     )
+#     evaluation_report = PropertyFile(
+#         name="AbaloneEvaluationReport",
+#         output_name="evaluation",
+#         path="evaluation.json",
+#     )
+#     step_eval = ProcessingStep(
+#         name="EvaluateAbaloneModel",
+#         step_args=step_args,
+#         property_files=[evaluation_report],
+#     )
 
-    # register model step that will be conditionally executed
-    model_metrics = ModelMetrics(
-        model_statistics=MetricsSource(
-            s3_uri="{}/evaluation.json".format(
-                step_eval.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
-            ),
-            content_type="application/json"
-        )
-    )
-    model = Model(
-        image_uri=image_uri,
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-        sagemaker_session=pipeline_session,
-        role=role,
-    )
-    step_args = model.register(
-        content_types=["text/csv"],
-        response_types=["text/csv"],
-        inference_instances=["ml.t2.medium", "ml.m5.large"],
-        transform_instances=["ml.m5.large"],
-        model_package_group_name=model_package_group_name,
-        approval_status=model_approval_status,
-        model_metrics=model_metrics,
-    )
-    step_register = ModelStep(
-        name="RegisterAbaloneModel",
-        step_args=step_args,
-    )
+#     # register model step that will be conditionally executed
+#     model_metrics = ModelMetrics(
+#         model_statistics=MetricsSource(
+#             s3_uri="{}/evaluation.json".format(
+#                 step_eval.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+#             ),
+#             content_type="application/json"
+#         )
+#     )
+#     model = Model(
+#         image_uri=image_uri,
+#         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+#         sagemaker_session=pipeline_session,
+#         role=role,
+#     )
+#     step_args = model.register(
+#         content_types=["text/csv"],
+#         response_types=["text/csv"],
+#         inference_instances=["ml.t2.medium", "ml.m5.large"],
+#         transform_instances=["ml.m5.large"],
+#         model_package_group_name=model_package_group_name,
+#         approval_status=model_approval_status,
+#         model_metrics=model_metrics,
+#     )
+#     step_register = ModelStep(
+#         name="RegisterAbaloneModel",
+#         step_args=step_args,
+#     )
 
-    # condition step for evaluating model quality and branching execution
-    cond_lte = ConditionLessThanOrEqualTo(
-        left=JsonGet(
-            step_name=step_eval.name,
-            property_file=evaluation_report,
-            json_path="regression_metrics.mse.value"
-        ),
-        right=6.0,
-    )
-    step_cond = ConditionStep(
-        name="CheckMSEAbaloneEvaluation",
-        conditions=[cond_lte],
-        if_steps=[step_register],
-        else_steps=[],
-    )
+#     # condition step for evaluating model quality and branching execution
+#     cond_lte = ConditionLessThanOrEqualTo(
+#         left=JsonGet(
+#             step_name=step_eval.name,
+#             property_file=evaluation_report,
+#             json_path="regression_metrics.mse.value"
+#         ),
+#         right=6.0,
+#     )
+#     step_cond = ConditionStep(
+#         name="CheckMSEAbaloneEvaluation",
+#         conditions=[cond_lte],
+#         if_steps=[step_register],
+#         else_steps=[],
+#     )
 
     # pipeline instance
     pipeline = Pipeline(
@@ -350,7 +355,7 @@ def get_pipeline(
             model_approval_status,
             input_data,
         ],
-        steps=[step_process, step_train, step_eval, step_cond],
+        steps=[step_process, step_train], #step_eval, step_cond],
         sagemaker_session=pipeline_session,
     )
     return pipeline
